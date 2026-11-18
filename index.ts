@@ -81,21 +81,18 @@ export default function (pi: ExtensionAPI) {
       maxTokens: model.maxTokens,
     }));
 
-    // Ensure all registered tools are active so pi can execute them.
-    // Some tools (find, grep, ls) are registered but not activated by default.
-    pi.on("session_start", async () => {
-      const allTools = pi.getAllTools();
-      if (Array.isArray(allTools)) {
-        pi.setActiveTools(allTools.map((t: any) => t.name));
-      }
-    });
-
     pi.registerProvider(PROVIDER_ID, {
       baseUrl: "pi-claude-cli",
       apiKey: "unused",
       api: "pi-claude-cli",
       models,
       streamSimple: (model, context, options) => {
+        // Claude's Grep and Glob map to these off-by-default Pi tools.
+        const active = new Set(pi.getActiveTools());
+        active.add("grep");
+        active.add("find");
+        pi.setActiveTools([...active]);
+
         const configPath = ensureMcpConfig(pi);
         return streamViaCli(model, context, {
           ...options,
