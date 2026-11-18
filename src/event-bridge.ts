@@ -14,6 +14,10 @@ import {
   isPiKnownClaudeTool,
 } from "./tool-mapping.js";
 
+function isArgumentObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 /**
  * Extended tracking for tool_use content blocks during streaming.
  * Stores the Claude tool name for argument translation at block_stop.
@@ -269,8 +273,11 @@ export function createEventBridge(
 
         // Try to parse accumulated JSON -- on success update args, on failure keep previous
         try {
-          block.arguments = JSON.parse(block.partialJson);
-          (output.content[idx] as any).arguments = block.arguments;
+          const parsed = JSON.parse(block.partialJson);
+          if (isArgumentObject(parsed)) {
+            block.arguments = parsed;
+            (output.content[idx] as any).arguments = block.arguments;
+          }
         } catch {
           // Partial JSON not yet parseable -- keep previous arguments
         }
@@ -322,11 +329,14 @@ export function createEventBridge(
         partial: output,
       });
     } else if (block.type === "tool_use") {
-      // Final JSON parse with fallback to raw string
+      // Missing deltas mean {}; preserve malformed nonempty input for validation.
       let finalArgs: Record<string, unknown> | string;
       try {
-        const parsed = JSON.parse(block.partialJson);
-        finalArgs = translateClaudeArgsToPi(block.claudeName, parsed);
+        const parsed =
+          block.partialJson.trim() === "" ? {} : JSON.parse(block.partialJson);
+        finalArgs = isArgumentObject(parsed)
+          ? translateClaudeArgsToPi(block.claudeName, parsed)
+          : block.partialJson;
       } catch {
         finalArgs = block.partialJson;
       }

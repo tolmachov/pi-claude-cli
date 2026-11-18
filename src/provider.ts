@@ -15,6 +15,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 import {
   AssistantMessageEventStream,
   type Model,
@@ -41,6 +42,20 @@ import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
+// Pi session IDs are not CLI session IDs; only resume a session we observed.
+const cliSessions = new Map<string, { cliId: string; historyKey: string }>();
+
+function errorText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (
+    value &&
+    typeof value === "object" &&
+    "message" in value &&
+    typeof value.message === "string"
+  )
+    return value.message.trim();
+  return "";
+}
 
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
 type StreamViaCLiOptions = SimpleStreamOptions & {
@@ -77,26 +92,64 @@ export function streamViaCli(
   (async () => {
     let proc: ReturnType<typeof spawnClaude> | undefined;
     let abortHandler: (() => void) | undefined;
+    const bridge = createEventBridge(stream, model);
 
     try {
+      if (options?.signal?.aborted) throw new Error("Request aborted");
       const cwd = options?.cwd ?? process.cwd();
 
-      // Resume if pi provides a session ID AND this isn't the first turn.
-      // Pi passes sessionId on every call (including first), but we can only
-      // --resume a CLI session that already exists on disk from a prior turn.
+      const piSessionId = options?.sessionId;
+      const systemPrompt = buildSystemPrompt(context, cwd);
+      const conversation = context.messages.filter(
+        (message) => message.role !== "system",
+      );
+      const historyKey = (messages: any[]) =>
+        createHash("sha256")
+          .update(
+            JSON.stringify({
+              cwd,
+              model: model.id,
+              systemPrompt,
+              messages: messages.map(
+                ({ role, content, toolName, toolCallId }) => ({
+                  role,
+                  content:
+                    typeof content === "string"
+                      ? [{ type: "text", text: content }]
+                      : content,
+                  toolName,
+                  toolCallId,
+                }),
+              ),
+            }),
+          )
+          .digest("hex");
+      const lastAssistantIndex = conversation
+        .map((message) => message.role)
+        .lastIndexOf("assistant");
+      const previous = piSessionId ? cliSessions.get(piSessionId) : undefined;
       const resumeSessionId =
-        options?.sessionId && context.messages.length > 1
-          ? options.sessionId
+        previous &&
+        lastAssistantIndex >= 0 &&
+        previous.historyKey ===
+          historyKey(conversation.slice(0, lastAssistantIndex + 1))
+          ? previous.cliId
           : undefined;
+      let observedSessionId = resumeSessionId;
+      function rememberSession() {
+        if (piSessionId && observedSessionId)
+          cliSessions.set(piSessionId, {
+            cliId: observedSessionId,
+            historyKey: historyKey([
+              ...conversation,
+              { role: "assistant", content: bridge.getOutput().content },
+            ]),
+          });
+      }
 
-      // Build prompt: if resuming, only send the latest user turn;
-      // otherwise build the full flattened conversation history
       const prompt = resumeSessionId
         ? buildResumePrompt(context)
         : buildPrompt(context);
-      const systemPrompt = resumeSessionId
-        ? undefined
-        : buildSystemPrompt(context, cwd);
 
       // Compute effort level from reasoning options
       const effort = mapThinkingEffort(
@@ -106,40 +159,37 @@ export function streamViaCli(
       );
 
       // Spawn subprocess
-      proc = spawnClaude(model.id, systemPrompt || undefined, {
-        cwd,
-        signal: options?.signal,
-        effort,
-        mcpConfigPath: options?.mcpConfigPath,
-        resumeSessionId,
-        newSessionId: !resumeSessionId ? options?.sessionId : undefined,
-      });
+      proc = spawnClaude(
+        model.id,
+        resumeSessionId ? undefined : systemPrompt || undefined,
+        {
+          cwd,
+          signal: options?.signal,
+          effort,
+          mcpConfigPath: options?.mcpConfigPath,
+          resumeSessionId,
+        },
+      );
       const getStderr = captureStderr(proc);
+      const processClosed = new Promise<void>((resolve) =>
+        proc!.once("close", () => resolve()),
+      );
+      let resultReceived = false;
 
       // Register in global process registry for teardown cleanup
       registerProcess(proc);
-
-      // Write user message to subprocess stdin
-      writeUserMessage(proc, prompt);
-
-      // Create event bridge (before endStreamWithError so bridge is in scope)
-      const bridge = createEventBridge(stream, model);
 
       // Guard against double stream.end() and double error events.
       // First error path wins; subsequent ones are no-ops.
       let streamEnded = false;
 
-      /**
-       * End the stream with an error, using a "done" event instead of "error".
-       *
-       * Why "done" not "error": AssistantMessageEventStream.extractResult()
-       * returns event.error (a string) for error events, but agent-loop.js
-       * then calls message.content.filter() on the result, crashing because
-       * a string has no .content property. By pushing "done" with a valid
-       * AssistantMessage (content:[]), pi gets a well-formed object.
-       */
-      function endStreamWithError(errMsg: string) {
-        if (streamEnded || broken) return;
+      // Error events carry an AssistantMessage, not a string or successful done.
+      function endStreamWithError(
+        errMsg: string,
+        reason: "error" | "aborted" = "error",
+      ) {
+        if (streamEnded || (broken && reason !== "aborted")) return;
+        if (piSessionId) cliSessions.delete(piSessionId);
         streamEnded = true;
         const output = bridge.getOutput();
         const errorMessage = {
@@ -147,14 +197,14 @@ export function streamViaCli(
           content: output.content?.length
             ? output.content
             : [{ type: "text" as const, text: `Error: ${errMsg}` }],
-          stopReason: "stop" as const,
+          stopReason: reason,
+          errorMessage: errMsg,
         };
-        stream.push({
-          type: "done",
-          reason: "stop",
-          message: errorMessage,
-        } as any);
+        stream.push({ type: "error", reason, error: errorMessage });
         stream.end();
+        clearTimeout(inactivityTimer);
+        cleanupProcess(proc!);
+        rl.close();
       }
 
       // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
@@ -178,10 +228,6 @@ export function streamViaCli(
           }
         };
 
-        if (options.signal.aborted) {
-          abortHandler();
-          return;
-        }
         options.signal.addEventListener("abort", abortHandler, { once: true });
       }
 
@@ -217,14 +263,11 @@ export function streamViaCli(
         }
       });
 
-      // Start inactivity timer after writing user message
-      resetInactivityTimer();
-
       // Process NDJSON lines from stdout using event-based callback
       // NOTE: Using 'line' event instead of `for await` because the async
       // iterator batches lines, breaking real-time streaming to pi.
       rl.on("line", (line: string) => {
-        if (broken) return; // Guard: ignore buffered lines after break-early
+        if (broken || streamEnded) return; // Ignore buffered lines after finalization.
 
         // Reset inactivity timer on each line of output
         resetInactivityTimer();
@@ -232,10 +275,21 @@ export function streamViaCli(
         const msg = parseLine(line);
         if (!msg) return;
 
+        if (
+          piSessionId &&
+          !msg.parent_tool_use_id &&
+          ((msg.type === "system" && msg.subtype === "init") ||
+            msg.type === "result") &&
+          typeof msg.session_id === "string" &&
+          msg.session_id
+        ) {
+          observedSessionId = msg.session_id;
+        }
+
         if (msg.type === "stream_event") {
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
-          const isTopLevel = !(msg as any).parent_tool_use_id;
+          const isTopLevel = !msg.parent_tool_use_id;
           if (isTopLevel) {
             bridge.handleEvent(msg.event);
           }
@@ -266,13 +320,22 @@ export function streamViaCli(
             // Pi will execute these tools. Kill subprocess to prevent CLI from executing them.
             forceKillProcess(proc!);
             rl.close();
-            return; // Don't process further -- done event already pushed by event bridge
+            return; // Finalize after readline closes, outside the synchronous handler.
           }
         } else if (msg.type === "control_request") {
           handleControlRequest(msg, proc!.stdin!);
-        } else if (msg.type === "result") {
-          if (msg.subtype === "error") {
-            endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
+        } else if (msg.type === "result" && !msg.parent_tool_use_id) {
+          resultReceived = true;
+          if (msg.is_error === true || msg.subtype !== "success") {
+            const detail =
+              errorText(msg.error) ||
+              errorText(msg.result) ||
+              (Array.isArray(msg.errors)
+                ? msg.errors.map(errorText).filter(Boolean).join("; ")
+                : errorText(msg.errors)) ||
+              getStderr().trim() ||
+              `Claude CLI reported ${msg.subtype}`;
+            endStreamWithError(detail);
           }
           // For both success and error: clean up the subprocess
           clearTimeout(inactivityTimer);
@@ -281,10 +344,30 @@ export function streamViaCli(
         }
       });
 
-      // Wait for readline to close (result received or process ended)
-      await new Promise<void>((resolve) => {
-        rl.on("close", resolve);
+      proc.stdin!.on("error", (err: NodeJS.ErrnoException) => {
+        // An oversized prompt may close stdin before its rejection arrives on stdout.
+        if (err.code !== "EPIPE") endStreamWithError(err.message);
       });
+      const closed = new Promise<void>((resolve) => rl.once("close", resolve));
+      resetInactivityTimer();
+      writeUserMessage(proc, prompt);
+      await closed;
+      if (options?.signal?.aborted)
+        endStreamWithError("Request aborted", "aborted");
+      // EOF can precede the child's nonzero close event. A result or intentional
+      // tool handoff may finish early, but bare EOF is not evidence of success.
+      if (!broken && !resultReceived && !streamEnded) {
+        await processClosed;
+        if (!streamEnded) {
+          const aborted = options?.signal?.aborted;
+          endStreamWithError(
+            aborted
+              ? "Request aborted"
+              : getStderr().trim() || "Claude CLI ended without a result",
+            aborted ? "aborted" : "error",
+          );
+        }
+      }
 
       // Push done event after readline closes (async). Pushing synchronously
       // inside handleMessageStop prevents pi from executing tools.
@@ -303,6 +386,7 @@ export function streamViaCli(
             ? "stop"
             : output.stopReason;
 
+        rememberSession();
         streamEnded = true;
         stream.push({
           type: "done",
@@ -317,10 +401,17 @@ export function streamViaCli(
         stream.end();
       }
     } catch (err: any) {
+      if (options?.sessionId) cliSessions.delete(options.sessionId);
+      if (proc) forceKillProcess(proc);
+      const reason = options?.signal?.aborted ? "aborted" : "error";
       stream.push({
         type: "error",
-        reason: "error",
-        error: err.message ?? "Unexpected error in streamViaCli",
+        reason,
+        error: {
+          ...bridge.getOutput(),
+          stopReason: reason,
+          errorMessage: err.message ?? "Unexpected error in streamViaCli",
+        },
       } as any);
       stream.end();
     } finally {
@@ -328,7 +419,7 @@ export function streamViaCli(
       if (options?.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
-      cleanupSystemPromptFile();
+      if (proc) cleanupSystemPromptFile(proc);
     }
   })();
 

@@ -6,7 +6,10 @@ import { PassThrough } from "node:stream";
 vi.mock("cross-spawn", () => ({
   default: vi.fn(() => {
     const proc = new EventEmitter();
-    const stdin = { write: vi.fn(), end: vi.fn() };
+    const stdin = Object.assign(new EventEmitter(), {
+      write: vi.fn(),
+      end: vi.fn(),
+    });
     const stdout = new PassThrough();
     const stderr = new EventEmitter();
     (proc as any).stdin = stdin;
@@ -67,6 +70,7 @@ vi.mock("@mariozechner/pi-ai", () => ({
   getModels: vi.fn(() => mockModels),
   AssistantMessageEventStream: MockAssistantMessageEventStream,
   calculateCost: vi.fn(),
+  getCurrentSystemPrompt: undefined,
 }));
 
 import spawn from "cross-spawn";
@@ -281,11 +285,9 @@ describe("streamViaCli", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-    const doneEvent = mockStream._events.find(
-      (e: any) => e.type === "done" && e.message,
-    );
-    expect(doneEvent).toBeDefined();
-    expect(doneEvent.message.content).toBeDefined();
+    const errorEvent = mockStream._events.find((e: any) => e.type === "error");
+    expect(errorEvent.error.stopReason).toBe("error");
+    expect(errorEvent.error.errorMessage).toBe("Rate limit exceeded");
     expect(mockStream.end).toHaveBeenCalled();
   });
 
@@ -1108,7 +1110,7 @@ describe("streamViaCli", () => {
   });
 
   describe("subprocess error handling", () => {
-    it("pushes done event when subprocess emits error (e.g. spawn failure)", async () => {
+    it("pushes a typed error event when subprocess emits error (e.g. spawn failure)", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1126,10 +1128,10 @@ describe("streamViaCli", () => {
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(doneEvent.error.content).toBeDefined();
       expect(mockStream.end).toHaveBeenCalled();
     });
 
@@ -1151,10 +1153,10 @@ describe("streamViaCli", () => {
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(doneEvent.error.content).toBeDefined();
       expect(mockStream.end).toHaveBeenCalled();
     });
 
@@ -1177,10 +1179,10 @@ describe("streamViaCli", () => {
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(doneEvent.error.content).toBeDefined();
     });
 
     it("does not push error on normal close (code 0)", async () => {
@@ -1308,10 +1310,10 @@ describe("streamViaCli", () => {
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(doneEvent.error.content).toBeDefined();
       expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
       // Clean up - end stdout so readline closes
@@ -1350,7 +1352,7 @@ describe("streamViaCli", () => {
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
       const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent).toBeUndefined();
 
@@ -1358,10 +1360,10 @@ describe("streamViaCli", () => {
       await vi.advanceTimersByTimeAsync(10_000);
 
       const doneEvent2 = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+        (e: any) => e.type === "error" && e.error,
       );
       expect(doneEvent2).toBeDefined();
-      expect(doneEvent2.message.content).toBeDefined();
+      expect(doneEvent2.error.content).toBeDefined();
 
       // Clean up
       proc.stdout.end();
@@ -1443,7 +1445,7 @@ describe("streamViaCli", () => {
   });
 
   describe("abort signal already aborted", () => {
-    it("kills subprocess immediately when signal is already aborted", async () => {
+    it("does not spawn a subprocess when the request is already aborted", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1454,12 +1456,11 @@ describe("streamViaCli", () => {
       streamViaCli(model, context, { signal: controller.signal });
       await vi.advanceTimersByTimeAsync(0);
 
-      const proc = (spawn as any).mock.results[0].value;
-      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
-
-      // Clean up
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
+      expect(spawn).not.toHaveBeenCalled();
+      const event =
+        MockAssistantMessageEventStream.mock.instances[0]._events[0];
+      expect(event.reason).toBe("aborted");
+      expect(event.error.stopReason).toBe("aborted");
     });
   });
 
@@ -1787,7 +1788,50 @@ describe("streamViaCli", () => {
   });
 
   describe("session resume via options.sessionId", () => {
-    it("passes --resume when sessionId option is provided on subsequent turn", async () => {
+    /** Run one turn to completion so the CLI session ID gets registered. */
+    async function runTurn(
+      model: any,
+      context: any,
+      options: any,
+      claudeSessionId?: string,
+      assistantText = "Hi",
+    ) {
+      const callIndex = (spawn as any).mock.calls.length;
+      streamViaCli(model, context, options);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[callIndex].value;
+      for (const event of [
+        {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        },
+        {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: assistantText },
+        },
+        { type: "content_block_stop", index: 0 },
+      ])
+        proc.stdout.write(
+          JSON.stringify({ type: "stream_event", event }) + "\n",
+        );
+      proc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          session_id: claudeSessionId,
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      return (spawn as any).mock.calls[callIndex][1] as string[];
+    }
+
+    it("never passes pi's session ID to --resume", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [
@@ -1797,74 +1841,114 @@ describe("streamViaCli", () => {
         ],
       };
 
-      streamViaCli(model, context, { sessionId: "sess-abc-123" } as any);
-      await vi.advanceTimersByTimeAsync(0);
+      const args = await runTurn(model, context, {
+        sessionId: "pi-sess-abc-123",
+      } as any);
 
-      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).not.toContain("--resume");
+      expect(args).not.toContain("pi-sess-abc-123");
+    });
+
+    it("resumes the CLI session ID reported by a previous turn", async () => {
+      const model = mockModels[0] as any;
+
+      await runTurn(
+        model,
+        { messages: [{ role: "user", content: "Hello" }] },
+        { sessionId: "pi-sess-1" } as any,
+        "cli-sess-xyz",
+      );
+
+      const args = await runTurn(
+        model,
+        {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Hi" },
+            { role: "user", content: "Follow-up" },
+          ],
+        },
+        { sessionId: "pi-sess-1" } as any,
+      );
+
       expect(args).toContain("--resume");
-      const idx = args.indexOf("--resume");
-      expect(args[idx + 1]).toBe("sess-abc-123");
-
-      // Clean up
-      const proc = (spawn as any).mock.results[0].value;
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
+      expect(args[args.indexOf("--resume") + 1]).toBe("cli-sess-xyz");
     });
 
-    it("passes --session-id on first turn when sessionId provided", async () => {
+    it("does not resume a CLI session belonging to a different pi session", async () => {
+      const model = mockModels[0] as any;
+
+      await runTurn(
+        model,
+        { messages: [{ role: "user", content: "Hello" }] },
+        { sessionId: "pi-sess-1" } as any,
+        "cli-sess-xyz",
+      );
+
+      const args = await runTurn(
+        model,
+        {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Hi" },
+            { role: "user", content: "Follow-up" },
+          ],
+        },
+        { sessionId: "pi-sess-2" } as any,
+      );
+
+      expect(args).not.toContain("--resume");
+    });
+
+    it("never passes --session-id", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
       };
 
-      streamViaCli(model, context, { sessionId: "sess-new" } as any);
-      await vi.advanceTimersByTimeAsync(0);
+      const args = await runTurn(model, context, {
+        sessionId: "pi-sess-new",
+      } as any);
 
-      const args = (spawn as any).mock.calls[0][1] as string[];
-      expect(args).not.toContain("--resume");
-      expect(args).toContain("--session-id");
-      const idx = args.indexOf("--session-id");
-      expect(args[idx + 1]).toBe("sess-new");
-
-      // Clean up
-      const proc = (spawn as any).mock.results[0].value;
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
-    });
-
-    it("does not pass --resume or --session-id when no sessionId option", async () => {
-      const model = mockModels[0] as any;
-      const context = {
-        messages: [{ role: "user", content: "Hello" }],
-      };
-
-      streamViaCli(model, context);
-      await vi.advanceTimersByTimeAsync(0);
-
-      const args = (spawn as any).mock.calls[0][1] as string[];
-      expect(args).not.toContain("--resume");
       expect(args).not.toContain("--session-id");
-
-      // Clean up
-      const proc = (spawn as any).mock.results[0].value;
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
     });
 
-    it("uses buildResumePrompt when sessionId is provided (sends only new content)", async () => {
+    it("does not pass --resume when no sessionId option", async () => {
       const model = mockModels[0] as any;
       const context = {
-        messages: [
-          { role: "user", content: "first message" },
-          { role: "assistant", content: "response" },
-          { role: "user", content: "follow-up" },
-        ],
+        messages: [{ role: "user", content: "Hello" }],
       };
 
-      streamViaCli(model, context, { sessionId: "sess-resume" } as any);
+      const args = await runTurn(model, context, undefined);
+
+      expect(args).not.toContain("--resume");
+    });
+
+    it("uses buildResumePrompt when resuming (sends only new content)", async () => {
+      const model = mockModels[0] as any;
+
+      await runTurn(
+        model,
+        { messages: [{ role: "user", content: "first message" }] },
+        { sessionId: "pi-sess-resume" } as any,
+        "cli-sess-resume",
+        "response",
+      );
+
+      streamViaCli(
+        model,
+        {
+          messages: [
+            { role: "user", content: "first message" },
+            { role: "assistant", content: "response" },
+            { role: "user", content: "follow-up" },
+          ],
+        },
+        { sessionId: "pi-sess-resume" } as any,
+      );
       await vi.advanceTimersByTimeAsync(0);
 
-      const proc = (spawn as any).mock.results[0].value;
+      const proc = (spawn as any).mock.results[1].value;
       const written = proc.stdin.write.mock.calls[0][0] as string;
       const parsed = JSON.parse(written.trim());
       // Should only contain the latest user message, not full history
@@ -1875,28 +1959,245 @@ describe("streamViaCli", () => {
       await vi.advanceTimersByTimeAsync(100);
     });
 
-    it("does not pass system prompt when resuming", async () => {
+    it("does not resend an unchanged system prompt when resuming", async () => {
       const model = mockModels[0] as any;
-      const context = {
+
+      await runTurn(
+        model,
+        {
+          systemPrompt: "Be helpful",
+          messages: [{ role: "user", content: "Hello" }],
+        },
+        { sessionId: "pi-sess-resume" } as any,
+        "cli-sess-resume",
+      );
+
+      const args = await runTurn(
+        model,
+        {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Hi" },
+            { role: "user", content: "follow-up" },
+          ],
+          systemPrompt: "Be helpful",
+        },
+        { sessionId: "pi-sess-resume" } as any,
+      );
+
+      expect(args).toContain("--resume");
+      expect(args).not.toContain("--append-system-prompt-file");
+      expect(args).not.toContain("--append-system-prompt");
+    });
+
+    it.each(["system", "model", "cwd", "history", "provider"])(
+      "replays full context instead of resuming an incompatible %s",
+      async (change) => {
+        const model = mockModels[0] as any;
+        const options = {
+          sessionId: `changed-${change}`,
+          cwd: "/original-project",
+        };
+        await runTurn(
+          model,
+          {
+            systemPrompt: "Original system",
+            messages: [{ role: "user", content: "Hello" }],
+          },
+          options,
+          "original-cli",
+        );
+        const messages = [
+          {
+            role: "user",
+            content: change === "history" ? "Rewritten history" : "Hello",
+          },
+          { role: "assistant", content: "Hi" },
+          ...(change === "provider"
+            ? [
+                { role: "user", content: "Other provider question" },
+                { role: "assistant", content: "Other provider answer" },
+              ]
+            : []),
+          { role: "user", content: "Follow-up" },
+        ];
+        const args = await runTurn(
+          change === "model" ? { ...model, id: "another-model" } : model,
+          {
+            systemPrompt:
+              change === "system" ? "Changed system" : "Original system",
+            messages,
+          },
+          {
+            ...options,
+            cwd: change === "cwd" ? "/another-project" : options.cwd,
+          },
+        );
+        expect(args).not.toContain("--resume");
+        const proc = (spawn as any).mock.results[1].value;
+        const input = proc.stdin.write.mock.calls[0][0];
+        expect(input).toContain("Hi");
+        expect(input).toContain("Follow-up");
+      },
+    );
+
+    it("starts a fresh CLI session after the conversation is reported missing", async () => {
+      const model = mockModels[0] as any;
+
+      await runTurn(
+        model,
+        { messages: [{ role: "user", content: "Hello" }] },
+        { sessionId: "pi-sess-stale" } as any,
+        "cli-sess-gone",
+      );
+
+      const followUp = {
         messages: [
           { role: "user", content: "Hello" },
           { role: "assistant", content: "Hi" },
           { role: "user", content: "follow-up" },
         ],
-        systemPrompt: "Be helpful",
       };
 
-      streamViaCli(model, context, { sessionId: "sess-resume" } as any);
+      streamViaCli(model, followUp, { sessionId: "pi-sess-stale" } as any);
       await vi.advanceTimersByTimeAsync(0);
 
-      const args = (spawn as any).mock.calls[0][1] as string[];
-      expect(args).toContain("--resume");
-      expect(args).not.toContain("--append-system-prompt");
+      const staleProc = (spawn as any).mock.results[1].value;
+      expect((spawn as any).mock.calls[1][1]).toContain("--resume");
 
-      // Clean up
+      staleProc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "cli-sess-gone",
+          errors: ["No conversation found with session ID: cli-sess-gone"],
+        }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      staleProc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const args = await runTurn(model, followUp, {
+        sessionId: "pi-sess-stale",
+      } as any);
+
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  describe("CLI result errors", () => {
+    /** Drive one turn and return the events pi received. */
+    async function runFailingTurn(resultMessage: Record<string, unknown>) {
+      const model = mockModels[0] as any;
+      streamViaCli(model, { messages: [{ role: "user", content: "hi" }] });
+      await vi.advanceTimersByTimeAsync(0);
+
       const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(JSON.stringify(resultMessage) + "\n");
+      await vi.advanceTimersByTimeAsync(0);
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const terminal = mockStream._events.find(
+        (e: any) => e.type === "done" || e.type === "error",
+      );
+      return { ...terminal, message: terminal.error ?? terminal.message };
+    }
+
+    it("surfaces error_during_execution instead of an empty message", async () => {
+      const doneEvent = await runFailingTurn({
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: ["No conversation found with session ID: abc"],
+      });
+
+      expect(doneEvent.type).toBe("error");
+      expect(doneEvent.message.stopReason).toBe("error");
+      expect(doneEvent.message.errorMessage).toContain("No conversation found");
+      expect(doneEvent.message.content).toHaveLength(1);
+      expect(doneEvent.message.content[0].text).toContain(
+        "No conversation found with session ID: abc",
+      );
+    });
+
+    it("surfaces a bare error subtype", async () => {
+      const doneEvent = await runFailingTurn({
+        type: "result",
+        subtype: "error",
+        error: "boom",
+      });
+
+      expect(doneEvent.message.content[0].text).toContain("boom");
+    });
+
+    it("extracts nested API errors without crashing the stdout handler", async () => {
+      const terminal = await runFailingTurn({
+        type: "result",
+        subtype: "error",
+        error: { message: "Nested API detail" },
+      });
+      expect(terminal.message.stopReason).toBe("error");
+      expect(terminal.message.errorMessage).toBe("Nested API detail");
+    });
+
+    it("falls back to the subtype when no detail is provided", async () => {
+      const doneEvent = await runFailingTurn({
+        type: "result",
+        subtype: "error_max_turns",
+      });
+
+      expect(doneEvent.message.content[0].text).toContain("error_max_turns");
+    });
+
+    it("keeps the CLI rejection after an early stdin EPIPE", async () => {
+      streamViaCli(mockModels[0] as any, {
+        messages: [{ role: "user", content: "large input" }],
+      });
+      const proc = (spawn as any).mock.results[0].value;
+      try {
+        expect(() =>
+          proc.stdin.emit(
+            "error",
+            Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
+          ),
+        ).not.toThrow();
+        proc.stdout.write(
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: true,
+            result: "Prompt is too long",
+          }) + "\n",
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const terminal =
+          MockAssistantMessageEventStream.mock.instances[0]._events.filter(
+            (e: any) => e.type === "error",
+          );
+        expect(terminal).toHaveLength(1);
+        expect(terminal[0].error.errorMessage).toBe("Prompt is too long");
+      } finally {
+        proc.stdout.end();
+        await vi.advanceTimersByTimeAsync(100);
+      }
+    });
+
+    it("does not report an error for a successful result", async () => {
+      const doneEvent = await runFailingTurn({
+        type: "result",
+        subtype: "success",
+        result: "ok",
+      });
+
+      expect(doneEvent).toBeDefined();
+      expect(
+        (doneEvent.message.content ?? []).some((block: any) =>
+          block.text?.startsWith("Error:"),
+        ),
+      ).toBe(false);
     });
   });
 });

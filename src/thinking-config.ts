@@ -48,6 +48,8 @@ export function isOpusModel(modelId: string): boolean {
   return modelId.includes("opus");
 }
 
+let warnedThinkingBudgets = false;
+
 /**
  * Map pi's ThinkingLevel to a CLI effort string.
  *
@@ -70,7 +72,12 @@ export function mapThinkingEffort(
     return undefined; // omit --effort flag entirely
   }
 
-  if (thinkingBudgets && Object.keys(thinkingBudgets).length > 0) {
+  if (
+    thinkingBudgets &&
+    Object.keys(thinkingBudgets).length > 0 &&
+    !warnedThinkingBudgets
+  ) {
+    warnedThinkingBudgets = true;
     console.warn(
       "[pi-claude-cli] Custom thinkingBudgets are not supported with CLI subprocess. " +
         "The CLI uses --effort levels instead of token budgets. Budgets will be ignored.",

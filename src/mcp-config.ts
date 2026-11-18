@@ -5,7 +5,7 @@
  * and generates an MCP config that points to the schema-only MCP server.
  */
 
-import { writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,8 @@ export function getCustomToolDefs(pi: any): McpToolDef[] {
     }));
 }
 
+let lastSchemaJson: string | undefined;
+
 /**
  * Write MCP config and tool schemas to temp files.
  *
@@ -91,7 +93,11 @@ export function writeMcpConfig(toolDefs: McpToolDef[]): string {
     tmpdir(),
     `pi-claude-mcp-schemas-${process.pid}.json`,
   );
-  writeFileSync(schemaFilePath, JSON.stringify(toolDefs));
+  const schemaJson = JSON.stringify(toolDefs);
+  if (schemaJson !== lastSchemaJson || !existsSync(schemaFilePath)) {
+    writeFileSync(schemaFilePath, schemaJson, { mode: 0o600 });
+    lastSchemaJson = schemaJson;
+  }
 
   // Resolve path to the schema server .cjs file (sibling of this module)
   const __filename = fileURLToPath(import.meta.url);
@@ -113,7 +119,21 @@ export function writeMcpConfig(toolDefs: McpToolDef[]): string {
     tmpdir(),
     `pi-claude-mcp-config-${process.pid}.json`,
   );
-  writeFileSync(configFilePath, JSON.stringify(config));
+  if (!existsSync(configFilePath)) {
+    writeFileSync(configFilePath, JSON.stringify(config), { mode: 0o600 });
+  }
 
   return configFilePath;
+}
+
+export function cleanupMcpConfigFiles(): void {
+  for (const name of ["schemas", "config"]) {
+    try {
+      unlinkSync(join(tmpdir(), `pi-claude-mcp-${name}-${process.pid}.json`));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn("[pi-claude-cli] MCP temp file cleanup failed:", err);
+      }
+    }
+  }
 }

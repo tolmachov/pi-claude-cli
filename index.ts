@@ -13,56 +13,31 @@ import {
   validateCliAuth,
   killAllProcesses,
 } from "./src/process-manager.js";
-import { getCustomToolDefs, writeMcpConfig } from "./src/mcp-config.js";
+import {
+  getCustomToolDefs,
+  writeMcpConfig,
+  cleanupMcpConfigFiles,
+} from "./src/mcp-config.js";
 
 // Kill all active Claude subprocesses on process exit to prevent orphans
-process.on("exit", killAllProcesses);
+process.on("exit", () => {
+  killAllProcesses();
+  cleanupMcpConfigFiles();
+});
 
 const PROVIDER_ID = "pi-claude-cli";
 
-let mcpConfigPath: string | undefined;
-let mcpConfigResolved = false;
-
-/**
- * Lazily generate MCP config on first request (not at load time).
- * pi.getAllTools() fails during extension loading; this defers it
- * until the pi runtime is fully initialized.
- *
- * Only locks (sets mcpConfigResolved) when getAllTools() returns a
- * real array — if it returns undefined/null (registry not ready),
- * we retry on the next request. Once the registry is ready we
- * commit to the result even if there are zero custom tools.
- *
- * Uses warn-don't-block: failure logs a warning but does not
- * prevent the provider from functioning (built-ins still work).
- */
+// Discovery can change between tool calls, including becoming an empty loadout.
 function ensureMcpConfig(pi: ExtensionAPI): string | undefined {
-  if (mcpConfigResolved) return mcpConfigPath;
   try {
-    const allTools = pi.getAllTools();
-
-    // Registry not ready yet — don't lock, retry on next call
-    if (!Array.isArray(allTools)) {
-      return mcpConfigPath;
-    }
-
-    // Registry is ready — lock regardless of whether custom tools exist
-    mcpConfigResolved = true;
-
-    const toolDefs = getCustomToolDefs(pi);
-    if (toolDefs.length > 0) {
-      mcpConfigPath = writeMcpConfig(toolDefs);
-      console.error(
-        `[pi-claude-cli] MCP config generated with ${toolDefs.length} custom tool(s)`,
-      );
-    }
+    return writeMcpConfig(getCustomToolDefs(pi));
   } catch (err) {
     console.warn(
       "[pi-claude-cli] MCP config generation failed, custom tools unavailable:",
       err,
     );
+    return undefined;
   }
-  return mcpConfigPath;
 }
 
 export default function (pi: ExtensionAPI) {

@@ -26,8 +26,6 @@ vi.mock("node:child_process", () => ({
 import spawn from "cross-spawn";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import {
   spawnClaude,
   writeUserMessage,
@@ -40,6 +38,17 @@ import {
   killAllProcesses,
   cleanupSystemPromptFile,
 } from "../src/process-manager";
+
+function promptPath(): string {
+  const args = (spawn as any).mock.calls.at(-1)[1];
+  return args[args.indexOf("--append-system-prompt-file") + 1];
+}
+
+afterEach(() => {
+  for (const result of (spawn as any).mock.results) {
+    if (result.type === "return") cleanupSystemPromptFile(result.value);
+  }
+});
 
 describe("spawnClaude", () => {
   beforeEach(() => {
@@ -91,29 +100,26 @@ describe("spawnClaude", () => {
     expect(options.cwd).toBe("/custom/path");
   });
 
-  it("writes system prompt to temp file and passes path via --append-system-prompt", () => {
+  it("writes system prompt to temp file and passes path via --append-system-prompt-file", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
-    const idx = args.indexOf("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
+    const idx = args.indexOf("--append-system-prompt-file");
     expect(args[idx + 1]).toContain("pi-claude-cli-sysprompt-");
   });
 
   it("temp file contains the system prompt text", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
-    const tmpFile = join(
-      tmpdir(),
-      `pi-claude-cli-sysprompt-${process.pid}.txt`,
-    );
+    const tmpFile = promptPath();
     expect(existsSync(tmpFile)).toBe(true);
     expect(readFileSync(tmpFile, "utf-8")).toBe("You are a helpful assistant.");
   });
 
-  it("does not include --append-system-prompt when no system prompt", () => {
+  it("does not include --append-system-prompt-file when no system prompt", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
-    expect(args).not.toContain("--append-system-prompt");
+    expect(args).not.toContain("--append-system-prompt-file");
   });
 
   it("returns the spawned ChildProcess", () => {
@@ -175,7 +181,7 @@ describe("effort flag", () => {
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).not.toContain("--effort");
   });
 });
@@ -338,6 +344,29 @@ describe("validateCliPresence", () => {
 });
 
 describe("validateCliAuth", () => {
+  it.each([true, false])(
+    "honors loggedIn=%s even after a successful command",
+    (loggedIn) => {
+      (execSync as any).mockReturnValue(
+        Buffer.from(JSON.stringify({ loggedIn })),
+      );
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(validateCliAuth()).toBe(loggedIn);
+        expect(warning).toHaveBeenCalledTimes(loggedIn ? 0 : 1);
+      } finally {
+        warning.mockRestore();
+      }
+    },
+  );
+
+  it.each(["", "Logged in", "{}", '{"loggedIn":null}', "not-json"])(
+    "falls back to successful exit status for legacy output %j",
+    (output) => {
+      (execSync as any).mockReturnValue(Buffer.from(output));
+      expect(validateCliAuth()).toBe(true);
+    },
+  );
   it("returns true when claude auth status succeeds", () => {
     (execSync as any).mockReturnValue(Buffer.from("Logged in"));
     expect(validateCliAuth()).toBe(true);
@@ -419,7 +448,7 @@ describe("mcp-config flag", () => {
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).toContain("--effort");
     expect(args).not.toContain("--mcp-config");
     expect(args).toContain("--permission-prompt-tool");
@@ -599,21 +628,22 @@ describe("resume session flag", () => {
 });
 
 describe("cleanupSystemPromptFile", () => {
-  const tmpFile = join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`);
-
-  it("deletes the temp file when it exists", () => {
-    // Create the file by spawning with a system prompt
-    spawnClaude("claude-sonnet-4-5-20250929", "test prompt");
-    expect(existsSync(tmpFile)).toBe(true);
-
-    cleanupSystemPromptFile();
-    expect(existsSync(tmpFile)).toBe(false);
+  it("deletes only the owning subprocess's file and is idempotent", () => {
+    const first = spawnClaude("test-model", "first prompt");
+    const firstPath = promptPath();
+    const second = spawnClaude("test-model", "second prompt");
+    const secondPath = promptPath();
+    expect(firstPath).not.toBe(secondPath);
+    cleanupSystemPromptFile(first);
+    cleanupSystemPromptFile(first);
+    expect(existsSync(firstPath)).toBe(false);
+    expect(readFileSync(secondPath, "utf-8")).toBe("second prompt");
+    cleanupSystemPromptFile(second);
+    expect(existsSync(secondPath)).toBe(false);
   });
 
-  it("does not throw when file does not exist", () => {
-    // Ensure file doesn't exist
-    cleanupSystemPromptFile();
-    // Call again — should not throw
-    expect(() => cleanupSystemPromptFile()).not.toThrow();
+  it("does not throw for a subprocess with no prompt file", () => {
+    const proc = spawnClaude("test-model");
+    expect(() => cleanupSystemPromptFile(proc)).not.toThrow();
   });
 });

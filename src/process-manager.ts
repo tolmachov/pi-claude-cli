@@ -7,17 +7,20 @@
  */
 
 import spawn from "cross-spawn";
+import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChildProcess } from "node:child_process";
 
+const systemPromptFiles = new WeakMap<ChildProcess, string>();
+
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
  *
  * @param modelId - The model ID to pass via --model flag
- * @param systemPrompt - Optional system prompt appended via --append-system-prompt
+ * @param systemPrompt - Optional system prompt appended via --append-system-prompt-file
  * @param options - Optional cwd, AbortSignal, and effort level
  * @returns The spawned ChildProcess with piped stdin/stdout/stderr
  */
@@ -30,7 +33,6 @@ export function spawnClaude(
     effort?: string;
     mcpConfigPath?: string;
     resumeSessionId?: string;
-    newSessionId?: string;
   },
 ): ChildProcess {
   const args = [
@@ -50,20 +52,18 @@ export function spawnClaude(
   if (options?.resumeSessionId) {
     // Resume an existing session — CLI loads prior conversation from disk
     args.push("--resume", options.resumeSessionId);
-  } else if (options?.newSessionId) {
-    // First turn: create session with this ID so subsequent turns can --resume it
-    args.push("--session-id", options.newSessionId);
   }
 
+  let promptFile: string | undefined;
   if (systemPrompt) {
     // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
-    // Claude CLI's --append-system-prompt accepts a file path or literal text.
-    const tmpFile = join(
+    // The literal-text flag would append the pathname instead of its contents.
+    promptFile = join(
       tmpdir(),
-      `pi-claude-cli-sysprompt-${process.pid}.txt`,
+      `pi-claude-cli-sysprompt-${process.pid}-${randomUUID()}.txt`,
     );
-    writeFileSync(tmpFile, systemPrompt, "utf-8");
-    args.push("--append-system-prompt", tmpFile);
+    writeFileSync(promptFile, systemPrompt, { encoding: "utf-8", mode: 0o600 });
+    args.push("--append-system-prompt-file", promptFile);
   }
 
   if (options?.effort) {
@@ -79,6 +79,10 @@ export function spawnClaude(
     cwd: options?.cwd ?? process.cwd(),
   });
 
+  if (promptFile) {
+    systemPromptFiles.set(proc, promptFile);
+    proc.once("close", () => cleanupSystemPromptFile(proc));
+  }
   return proc as ChildProcess;
 }
 
@@ -86,11 +90,16 @@ export function spawnClaude(
  * Clean up the temp system prompt file created by spawnClaude.
  * Safe to call multiple times or when no file exists.
  */
-export function cleanupSystemPromptFile(): void {
+export function cleanupSystemPromptFile(proc: ChildProcess): void {
+  const file = systemPromptFiles.get(proc);
+  if (!file) return;
   try {
-    unlinkSync(join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`));
-  } catch {
-    // File doesn't exist or already deleted — ignore
+    unlinkSync(file);
+    systemPromptFiles.delete(proc);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT")
+      systemPromptFiles.delete(proc);
+    else console.warn("[pi-claude-cli] System prompt cleanup failed:", err);
   }
 }
 
@@ -205,14 +214,26 @@ export function validateCliPresence(): void {
  * @returns true if authenticated, false otherwise
  */
 export function validateCliAuth(): boolean {
+  let loggedIn = true;
   try {
-    execSync("claude auth status", { stdio: "pipe", timeout: 5000 });
-    return true;
+    const output = execSync("claude auth status", {
+      stdio: "pipe",
+      timeout: 5000,
+    }).toString();
+    try {
+      const status = JSON.parse(output);
+      if (typeof status?.loggedIn === "boolean") loggedIn = status.loggedIn;
+    } catch {
+      // Older CLI releases use plain text; retain the successful exit status.
+    }
   } catch {
+    loggedIn = false;
+  }
+  if (!loggedIn) {
     console.warn(
       "[pi-claude-cli] Claude CLI is not authenticated. " +
         "Run 'claude auth login' to authenticate.",
     );
-    return false;
   }
+  return loggedIn;
 }

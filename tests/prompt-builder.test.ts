@@ -469,7 +469,7 @@ describe("image passthrough (HIST-02)", () => {
     warnSpy.mockRestore();
   });
 
-  it("buildPrompt with custom tool result prompt (images in earlier messages) returns string", () => {
+  it("replays the image and custom tool result together on a new session", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const context = {
       messages: [
@@ -499,8 +499,9 @@ describe("image passthrough (HIST-02)", () => {
     } as unknown as any;
 
     const result = buildPrompt(context);
-    // Custom tool result prompt always returns string
-    expect(typeof result).toBe("string");
+    expect(Array.isArray(result)).toBe(true);
+    expect(JSON.stringify(result)).toContain("imgdata");
+    expect(JSON.stringify(result)).toContain("Deploy succeeded");
     warnSpy.mockRestore();
   });
 });
@@ -757,7 +758,7 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Do things carefully.");
   });
 
-  it("sanitizes .pi references to .claude in AGENTS.md content", async () => {
+  it("preserves .pi references in AGENTS.md content", async () => {
     vi.doMock("node:fs", () => ({
       existsSync: (path: string) => path.endsWith("AGENTS.md"),
       readFileSync: () => "Check ~/.pi/config and .pi/settings for details.",
@@ -766,9 +767,9 @@ describe("buildSystemPrompt", () => {
     const { buildSystemPrompt: bsp } = await import("../src/prompt-builder");
     const context = { systemPrompt: "Base.", messages: [] } as unknown as any;
     const result = bsp(context, "/some/project");
-    expect(result).toContain("~/.claude");
-    expect(result).toContain(".claude/settings");
-    expect(result).not.toContain(".pi/");
+    expect(result).toContain("~/.pi/config");
+    expect(result).toContain(".pi/settings");
+    expect(result).not.toContain(".claude/");
   });
 
   it("returns empty string when no systemPrompt and no AGENTS.md", async () => {
@@ -850,7 +851,7 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Base.");
   });
 
-  it("sanitizes AGENTS.md with special regex characters", async () => {
+  it("preserves AGENTS.md paths with special regex characters", async () => {
     vi.doMock("node:fs", () => ({
       existsSync: (path: string) => path.endsWith("AGENTS.md"),
       readFileSync: () =>
@@ -863,9 +864,9 @@ describe("buildSystemPrompt", () => {
       messages: [],
     } as unknown as any;
     const result = bsp(context, "/some/project");
-    expect(result).toContain("~/.claude/settings.json");
-    expect(result).toContain(".claude/rules/*.md");
-    expect(result).not.toContain(".pi/");
+    expect(result).toContain("~/.pi/settings.json");
+    expect(result).toContain(".pi/rules/*.md");
+    expect(result).not.toContain(".claude/");
   });
 
   it("handles readFileSync error gracefully (skip silently)", async () => {
@@ -888,7 +889,7 @@ describe("buildSystemPrompt", () => {
     expect(result).not.toContain("EACCES");
   });
 
-  it("appends tool result instruction when messages contain toolResult", async () => {
+  it("does not change system instructions merely because a tool result arrives", async () => {
     vi.doMock("node:fs", () => ({
       existsSync: () => false,
       readFileSync: () => "",
@@ -907,8 +908,7 @@ describe("buildSystemPrompt", () => {
       ],
     } as unknown as any;
     const result = bsp(context, "/some/project");
-    expect(result).toContain("IMPORTANT:");
-    expect(result).toContain("tool results");
+    expect(result).toBe("Base prompt.");
   });
 });
 

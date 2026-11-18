@@ -84,6 +84,15 @@ describe("mapThinkingEffort", () => {
   });
 
   describe("thinkingBudgets warning", () => {
+    it("warns once across repeated requests without changing effort mapping", async () => {
+      vi.resetModules();
+      const { mapThinkingEffort: map } = await import("../src/thinking-config");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(map("high", "claude-sonnet-4-5", { high: 50000 })).toBe("high");
+      expect(map("medium", "claude-opus-4-6", { medium: 10000 })).toBe("high");
+      expect(map("high", "claude-sonnet-4-5", { high: 50000 })).toBe("high");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    });
     afterEach(() => {
       vi.restoreAllMocks();
     });

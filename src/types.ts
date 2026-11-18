@@ -2,27 +2,33 @@
 
 // NDJSON message types from Claude CLI stdout
 
-export interface ClaudeStreamEventMessage {
+interface ClaudeMessageEnvelope {
+  parent_tool_use_id?: string | null;
+}
+
+export interface ClaudeStreamEventMessage extends ClaudeMessageEnvelope {
   type: "stream_event";
   event: ClaudeApiEvent;
 }
 
-export interface ClaudeResultMessage {
+export interface ClaudeResultMessage extends ClaudeMessageEnvelope {
   type: "result";
-  subtype: "success" | "error";
+  subtype: string;
   result?: string;
-  error?: string;
+  error?: string | { message?: string };
+  is_error?: boolean;
+  errors?: string[];
   session_id?: string;
 }
 
-export interface ClaudeSystemMessage {
+export interface ClaudeSystemMessage extends ClaudeMessageEnvelope {
   type: "system";
   subtype: string;
   session_id?: string;
   tools?: unknown[];
 }
 
-export interface ClaudeControlRequest {
+export interface ClaudeControlRequest extends ClaudeMessageEnvelope {
   type: "control_request";
   request_id: string;
   request: {

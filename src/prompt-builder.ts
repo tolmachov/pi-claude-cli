@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
+import * as piAi from "@mariozechner/pi-ai";
 import {
   mapPiToolNameToClaude,
   translatePiArgsToClaude,
@@ -112,103 +113,50 @@ function contentHasImages(content: string | any[]): boolean {
 }
 
 /**
- * Check if the conversation ends with a custom tool result.
- * If so, build a simplified prompt that presents the result directly
- * instead of replaying the full conversation history with tool labels.
- */
-function buildCustomToolResultPrompt(messages: any[]): string | null {
-  if (messages.length < 3) return null;
-
-  const last = messages[messages.length - 1];
-  if (last.role !== "toolResult") return null;
-  if (!last.toolName || !isCustomToolName(last.toolName)) return null;
-
-  // Find the original user message (scan backwards past assistant + toolResult)
-  let userMessage: string | null = null;
-  for (let i = messages.length - 3; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      userMessage = userContentToText(messages[i].content);
-      break;
-    }
-  }
-  if (!userMessage) return null;
-
-  const toolResult = toolResultContentToText(last.content);
-  return `${userMessage}\n\n[The ${last.toolName} tool was called and returned the following result]\n${toolResult}\n\nRespond to the user using the tool result above.`;
-}
-
-/**
- * Build a prompt for a resumed session.
- *
- * When resuming via --resume, the CLI already has the full conversation history.
- * We only need to send the new content since the last turn: the last assistant
- * response's tool results (if any) followed by the latest user message.
- *
- * For tool_use flows: pi sends [user, assistant(toolCall), toolResult, ...]
- * We need to include tool results so the resumed session sees them, plus the
- * final user message.
- *
- * Falls back to full prompt if the message structure is unexpected.
+ * Resume sends only input after the latest assistant response.
+ * Full-history replay is reserved for a new CLI session.
  */
 export function buildResumePrompt(context: {
   messages: any[];
 }): string | AnthropicContentBlock[] {
-  const messages = context.messages;
-  if (messages.length === 0) return "";
-
-  // Find the last user message
-  const finalUserIndex = findFinalUserMessageIndex(messages);
-  if (finalUserIndex < 0) return "";
-
-  // Collect new messages: everything from the last assistant turn onwards
-  // (tool results from the last assistant + the new user message)
-  const newMessages: any[] = [];
-
-  // Walk backwards from finalUserIndex to find where new content starts.
-  // Include trailing toolResult messages that follow the last assistant turn.
-  let startIdx = finalUserIndex;
-  for (let i = finalUserIndex - 1; i >= 0; i--) {
-    if (messages[i].role === "toolResult") {
-      startIdx = i;
-    } else {
+  placeholderImageCount = 0;
+  let lastAssistantIndex = -1;
+  for (let i = context.messages.length - 1; i >= 0; i--) {
+    if (context.messages[i].role === "assistant") {
+      lastAssistantIndex = i;
       break;
     }
   }
 
-  for (let i = startIdx; i < messages.length; i++) {
-    newMessages.push(messages[i]);
-  }
-
-  // If there are only tool results + one user message, build a combined prompt
   const parts: string[] = [];
-  for (const msg of newMessages) {
-    if (msg.role === "toolResult") {
-      if (msg.toolName && isCustomToolName(msg.toolName)) {
-        parts.push(`TOOL RESULT (${msg.toolName}):`);
-      } else {
-        const claudeToolName = msg.toolName
-          ? mapPiToolNameToClaude(msg.toolName)
-          : "unknown";
-        parts.push(`TOOL RESULT (historical ${claudeToolName}):`);
+  const blocks: AnthropicContentBlock[] = [];
+  const flushText = () => {
+    if (parts.length)
+      blocks.push({ type: "text", text: parts.splice(0).join("\n") });
+  };
+
+  for (const message of context.messages.slice(lastAssistantIndex + 1)) {
+    if (message.role !== "user" && message.role !== "toolResult") continue;
+    if (message.role === "toolResult") {
+      const name = message.toolName ?? "unknown";
+      parts.push(
+        isCustomToolName(name)
+          ? `TOOL RESULT (${name}):`
+          : `TOOL RESULT (historical ${mapPiToolNameToClaude(name)}):`,
+      );
+    }
+    for (const block of buildFinalUserContent(message.content)) {
+      if (block.type === "text") parts.push(block.text);
+      else {
+        flushText();
+        blocks.push(block);
       }
-      parts.push(toolResultContentToText(msg.content));
-    } else if (msg.role === "user") {
-      // Check for images in the final user message
-      if (contentHasImages(msg.content)) {
-        const textSoFar = parts.join("\n");
-        const userContent = buildFinalUserContent(msg.content);
-        const result: AnthropicContentBlock[] = [];
-        if (textSoFar) {
-          result.push({ type: "text", text: textSoFar });
-        }
-        result.push(...userContent);
-        return result;
-      }
-      parts.push(userContentToText(msg.content));
     }
   }
 
-  return parts.join("\n") || "";
+  if (!blocks.length) return parts.join("\n");
+  flushText();
+  return blocks;
 }
 
 export function buildPrompt(context: {
@@ -216,19 +164,6 @@ export function buildPrompt(context: {
 }): string | AnthropicContentBlock[] {
   // Reset placeholder counter for each call
   placeholderImageCount = 0;
-
-  // Special case: when conversation ends with a custom tool result,
-  // present it directly instead of complex history replay
-  const customToolPrompt = buildCustomToolResultPrompt(context.messages);
-  if (customToolPrompt) {
-    // customToolPrompt calls userContentToText which may increment placeholderImageCount
-    if (placeholderImageCount > 0) {
-      console.warn(
-        `[pi-claude-cli] ${placeholderImageCount} image(s) in conversation history could not be included in the prompt`,
-      );
-    }
-    return customToolPrompt;
-  }
 
   // Determine if any message has images worth passing through
   const finalUserIndex = findFinalUserMessageIndex(context.messages);
@@ -351,7 +286,6 @@ function findFinalUserMessageIndex(messages: any[]): number {
 /**
  * Builds the system prompt from the context's systemPrompt field,
  * appending AGENTS.md content if found (walking up from cwd, then global fallback).
- * Sanitizes .pi references to .claude for Claude Code compatibility.
  */
 export function buildSystemPrompt(
   context: { systemPrompt?: string; messages: any[] },
@@ -359,29 +293,25 @@ export function buildSystemPrompt(
 ): string {
   const parts: string[] = [];
 
-  if (context.systemPrompt) {
-    parts.push(context.systemPrompt);
-  }
+  // Pi 1.5 carries instructions/section updates in system messages; older hosts
+  // provide systemPrompt directly. Let the installed SDK render its transcript.
+  const renderSystemPrompt = Reflect.get(piAi, "getCurrentSystemPrompt");
+  const systemPrompt =
+    context.systemPrompt ??
+    (typeof renderSystemPrompt === "function"
+      ? renderSystemPrompt(context.messages)
+      : "");
+  if (systemPrompt) parts.push(systemPrompt);
 
   // Look for AGENTS.md
   const agentsPath = resolveAgentsMdPath(cwd);
   if (agentsPath) {
     try {
       const content = readFileSync(agentsPath, "utf-8");
-      const sanitized = sanitizeAgentsContent(content);
-      parts.push(sanitized);
+      parts.push(content);
     } catch {
       // If we can't read it, skip silently
     }
-  }
-
-  // When conversation history has tool results, instruct Claude to use them
-  // instead of trying to re-call tools (which may not be available).
-  if (context.messages?.some((m: any) => m.role === "toolResult")) {
-    parts.push(
-      "IMPORTANT: The conversation history below contains tool results from previously executed tools. " +
-        "Use these results to answer the user's question. Do NOT attempt to re-call tools that already have results.",
-    );
   }
 
   return parts.join("\n\n");
@@ -496,19 +426,4 @@ function resolveAgentsMdPath(cwd: string): string | undefined {
   if (existsSync(globalPath)) return globalPath;
 
   return undefined;
-}
-
-/**
- * Sanitize .pi references to .claude in AGENTS.md content
- * for Claude Code compatibility.
- */
-function sanitizeAgentsContent(content: string): string {
-  let sanitized = content;
-  // ~/.pi -> ~/.claude
-  sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
-  // .pi/ -> .claude/ (at word boundary or after whitespace/quotes)
-  sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
-  // Remaining standalone .pi references
-  sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-  return sanitized;
 }

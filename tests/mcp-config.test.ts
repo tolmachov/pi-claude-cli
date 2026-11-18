@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
 // Mock node:fs writeFileSync to avoid disk I/O
 vi.mock("node:fs", () => ({
   writeFileSync: mocks.writeFileSync,
+  existsSync: () => false,
+  unlinkSync: vi.fn(),
 }));
 
 // Mock node:os tmpdir
